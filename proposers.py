@@ -10,6 +10,9 @@ CL_NODE_URL = 'http://localhost:5052'
 FEEFILE = 'fee_recipient_transactions.csv'
 OUTFILE = 'proposers.csv'
 
+
+# connect to mev-inspect-py database
+
 connection = psycopg2.connect(
     host="127.0.0.1",
     port=5432,
@@ -18,16 +21,26 @@ connection = psycopg2.connect(
     database="mev_inspect"
 )
 cursor = connection.cursor()
+
+
+# query to calculate actual value received by fee recipient
+
 sql = (
     'select sum((gas_price - base_fee_per_gas) * gas_used), '
     '       sum(coinbase_transfer) '
     'from miner_payments where block_number = %s;'
 )
 
+
+# query CL node for validator indices of proposers in given epoch
+
 def get_proposers(epoch):
-    r = requests.get(CL_NODE_URL + f'/eth/v1/validator/duties/proposer/{epoch}')
+    r = requests.get(CL_NODE_URL+f'/eth/v1/validator/duties/proposer/{epoch}')
     data = r.json()['data']
     return [data[i]['validator_index'] for i in range(32)]
+
+
+# load the builder payee information
 
 with open(FEEFILE) as f:
     rows = csv.reader(f)
@@ -45,6 +58,9 @@ with open(FEEFILE) as f:
         else:
             builder_payees[-1][1] = 'multiple'
 
+
+# prepare output CSV file
+
 header = [
         'slot',
         'val_index',
@@ -59,6 +75,10 @@ with open(OUTFILE, 'w') as f:
     writer = csv.writer(f)
     writer.writerow(header)
 
+
+# iterate through slots retrieving block info for each slot
+# until we reach the final block saved in mev-inspect-py db
+
 slot = MERGE_SLOT
 proposers = get_proposers(slot // 32)
 rows = []
@@ -72,14 +92,20 @@ start_time = time.time()
 while True:
     if slot % 32 == 0:
         proposers = get_proposers(slot // 32)
+
+    # retrieve block from CL client (to reconcile block and slot numbers)
     json = requests.get(CL_NODE_URL + f'/eth/v2/beacon/blocks/{slot}').json()
     if 'data' in json:
         execution_payload = json['data']['message']['body']['execution_payload']
         block_number = int(execution_payload['block_number'])
         if block_number > end_block:
             break
+
+        # fee recipient corresponds to the block builder
         fee_recipient = execution_payload['fee_recipient']
 
+
+        # look up the builder payee (assumed to be EL address of proposer)
         if len(builder_payees) == 0 or block_number < builder_payees[0][0]:
             builder_payee = fee_recipient
         elif block_number == builder_payees[0][0]:
@@ -87,9 +113,12 @@ while True:
         else:
             raise Exception('whoops')
             
+        # get mev-inspect-py data for this block
         cursor.execute(sql, (block_number,))
         result = cursor.fetchone()
         net_fees, coinbase_transfer = result
+
+        # prepare row for writing to CSV
         row = [
             slot,
             proposers[slot % 32],
@@ -100,6 +129,7 @@ while True:
             builder_payee
         ]
     else:
+        # no block in this slot
         row = [slot, proposers[slot % 32], None, None, None, None, None]
 
     with open(OUTFILE, 'a') as f:
@@ -109,6 +139,7 @@ while True:
     
     slot += 1
 
+    # progress update
     t = time.time()
     if t - last_update > 0.1:
         elapsed = timedelta(seconds = int(t - start_time))
